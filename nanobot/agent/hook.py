@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from nanobot.agent.benchmark import BenchmarkTrace
+
 from loguru import logger
 
 from nanobot.providers.base import LLMResponse, ToolCallRequest
@@ -24,6 +26,7 @@ class AgentHookContext:
     final_content: str | None = None
     stop_reason: str | None = None
     error: str | None = None
+    benchmark: BenchmarkTrace | None = None
 
 
 class AgentHook:

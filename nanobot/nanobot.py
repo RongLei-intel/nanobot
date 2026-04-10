@@ -6,6 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nanobot.agent.benchmark import (
+    BenchmarkTrace,
+    benchmark_enabled,
+    benchmark_perfetto_trace_path,
+    benchmark_trace_path,
+)
 from nanobot.agent.hook import AgentHook
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
@@ -18,6 +24,7 @@ class RunResult:
     content: str
     tools_used: list[str]
     messages: list[dict[str, Any]]
+    benchmark: BenchmarkTrace | None = None
 
 
 class Nanobot:
@@ -98,17 +105,39 @@ class Nanobot:
             hooks: Optional lifecycle hooks for this run.
         """
         prev = self._loop._extra_hooks
+        benchmark = BenchmarkTrace()
+        if benchmark_enabled():
+            benchmark.start(session_key=session_key)
+        else:
+            benchmark = None
         if hooks is not None:
             self._loop._extra_hooks = list(hooks)
+        prev_benchmark = getattr(self._loop, "_benchmark", None)
+        self._loop._benchmark = benchmark
         try:
             response = await self._loop.process_direct(
                 message, session_key=session_key,
             )
         finally:
             self._loop._extra_hooks = prev
+            self._loop._benchmark = prev_benchmark
+
+        if benchmark is not None:
+            benchmark.finish()
+            trace_path = benchmark_trace_path()
+            if trace_path:
+                benchmark.write_json(trace_path)
+            perfetto_trace_path = benchmark_perfetto_trace_path()
+            if perfetto_trace_path:
+                benchmark.write_perfetto_json(perfetto_trace_path)
 
         content = (response.content if response else None) or ""
-        return RunResult(content=content, tools_used=[], messages=[])
+        return RunResult(
+            content=content,
+            tools_used=(response.tools_used if response else []) if hasattr(response, "tools_used") else [],
+            messages=(response.messages if response else []) if hasattr(response, "messages") else [],
+            benchmark=benchmark,
+        )
 
 
 def _make_provider(config: Any) -> Any:

@@ -192,6 +192,7 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+        self._benchmark = None
 
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
@@ -347,6 +348,7 @@ class AgentLoop:
             hook=hook,
             error_message="Sorry, I encountered an error calling the AI model.",
             concurrent_tools=True,
+            benchmark=self._benchmark,
         ))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
@@ -416,57 +418,38 @@ class AgentLoop:
                         nonlocal stream_segment
                         meta = dict(msg.metadata or {})
                         meta["_stream_end"] = True
-                        meta["_resuming"] = resuming
                         meta["_stream_id"] = _current_stream_id()
+                        meta["_stream_resuming"] = resuming
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
                             content="",
                             metadata=meta,
                         ))
-                        stream_segment += 1
+                        if resuming:
+                            stream_segment += 1
 
                 response = await self._process_message(
-                    msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                    msg,
+                    on_stream=on_stream,
+                    on_stream_end=on_stream_end,
                 )
-                if response is not None:
+                if response:
                     await self.bus.publish_outbound(response)
-                elif msg.channel == "cli":
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="", metadata=msg.metadata or {},
-                    ))
             except asyncio.CancelledError:
-                logger.info("Task cancelled for session {}", msg.session_key)
                 raise
-            except Exception:
-                logger.exception("Error processing message for session {}", msg.session_key)
+            except Exception as e:
+                logger.exception("Error processing message")
                 await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Sorry, I encountered an error: {e}",
                 ))
-
-    async def close_mcp(self) -> None:
-        """Drain pending background archives, then close MCP connections."""
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-            self._background_tasks.clear()
-        if self._mcp_stack:
-            try:
-                await self._mcp_stack.aclose()
-            except (RuntimeError, BaseExceptionGroup):
-                pass  # MCP SDK cancel scope cleanup is noisy but harmless
-            self._mcp_stack = None
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
         task = asyncio.create_task(coro)
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
-
-    def stop(self) -> None:
-        """Stop the agent loop."""
-        self._running = False
-        logger.info("Agent loop stopping")
 
     async def _process_message(
         self,
@@ -477,58 +460,159 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
+        benchmark = self._benchmark
         # System messages: parse origin from chat_id ("channel:chat_id")
         if msg.channel == "system":
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
                                 else ("cli", msg.chat_id))
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
+
+            started = time.perf_counter()
+            phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
             session = self.sessions.get_or_create(key)
+            phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+            if benchmark is not None:
+                benchmark.add_top_level_duration("session_load_duration_ms", (time.perf_counter() - started) * 1000)
+                benchmark.add_span(name="session_load", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+
+            started = time.perf_counter()
+            phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+            if benchmark is not None:
+                benchmark.add_top_level_duration("memory_consolidation_before_duration_ms", (time.perf_counter() - started) * 1000)
+                benchmark.add_span(name="memory_consolidation_before", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+
+            started = time.perf_counter()
+            phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+            if benchmark is not None:
+                benchmark.add_top_level_duration("tool_context_setup_duration_ms", (time.perf_counter() - started) * 1000)
+                benchmark.add_span(name="tool_context_setup", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
+
+            started = time.perf_counter()
+            phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
+            phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+            if benchmark is not None:
+                benchmark.add_top_level_duration("context_build_duration_ms", (time.perf_counter() - started) * 1000)
+                benchmark.add_span(name="context_build", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+
+            started = time.perf_counter()
+            phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
             )
+            phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+            if benchmark is not None:
+                benchmark.add_top_level_duration("agent_loop_duration_ms", (time.perf_counter() - started) * 1000)
+                benchmark.add_span(name="agent_loop", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+
+            started = time.perf_counter()
+            phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
             self._save_turn(session, all_msgs, 1 + len(history))
+            phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+            if benchmark is not None:
+                benchmark.add_top_level_duration("save_turn_duration_ms", (time.perf_counter() - started) * 1000)
+                benchmark.add_span(name="save_turn", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+
+            started = time.perf_counter()
+            phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
             self.sessions.save(session)
+            phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+            if benchmark is not None:
+                benchmark.add_top_level_duration("session_save_duration_ms", (time.perf_counter() - started) * 1000)
+                benchmark.add_span(name="session_save", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+
+            started = time.perf_counter()
+            phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
-            return OutboundMessage(channel=channel, chat_id=chat_id,
+            phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+            if benchmark is not None:
+                benchmark.add_top_level_duration("background_schedule_duration_ms", (time.perf_counter() - started) * 1000)
+                benchmark.add_span(name="background_schedule", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+
+            started = time.perf_counter()
+            phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
+            outbound = OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
+            phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+            if benchmark is not None:
+                benchmark.add_top_level_duration("response_build_duration_ms", (time.perf_counter() - started) * 1000)
+                benchmark.add_span(name="response_build", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+            return outbound
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
+
+        started = time.perf_counter()
+        phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
         session = self.sessions.get_or_create(key)
+        phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+        if benchmark is not None:
+            benchmark.add_top_level_duration("session_load_duration_ms", (time.perf_counter() - started) * 1000)
+            benchmark.add_span(name="session_load", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
 
         # Slash commands
         raw = msg.content.strip()
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
+        started = time.perf_counter()
+        phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
         if result := await self.commands.dispatch(ctx):
+            phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+            if benchmark is not None:
+                benchmark.add_top_level_duration("command_dispatch_duration_ms", (time.perf_counter() - started) * 1000)
+                benchmark.add_span(name="command_dispatch", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2, args={"matched": True})
             return result
+        phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+        if benchmark is not None:
+            benchmark.add_top_level_duration("command_dispatch_duration_ms", (time.perf_counter() - started) * 1000)
+            benchmark.add_span(name="command_dispatch", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2, args={"matched": False})
 
+        started = time.perf_counter()
+        phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+        if benchmark is not None:
+            benchmark.add_top_level_duration("memory_consolidation_before_duration_ms", (time.perf_counter() - started) * 1000)
+            benchmark.add_span(name="memory_consolidation_before", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
 
+        started = time.perf_counter()
+        phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
+        phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+        if benchmark is not None:
+            benchmark.add_top_level_duration("tool_context_setup_duration_ms", (time.perf_counter() - started) * 1000)
+            benchmark.add_span(name="tool_context_setup", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
 
         history = session.get_history(max_messages=0)
+        started = time.perf_counter()
+        phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
+        phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+        if benchmark is not None:
+            benchmark.add_top_level_duration("context_build_duration_ms", (time.perf_counter() - started) * 1000)
+            benchmark.add_span(name="context_build", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
@@ -538,6 +622,8 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
+        started = time.perf_counter()
+        phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
@@ -546,13 +632,37 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
         )
+        phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+        if benchmark is not None:
+            benchmark.add_top_level_duration("agent_loop_duration_ms", (time.perf_counter() - started) * 1000)
+            benchmark.add_span(name="agent_loop", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
+        started = time.perf_counter()
+        phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
         self._save_turn(session, all_msgs, 1 + len(history))
+        phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+        if benchmark is not None:
+            benchmark.add_top_level_duration("save_turn_duration_ms", (time.perf_counter() - started) * 1000)
+            benchmark.add_span(name="save_turn", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+
+        started = time.perf_counter()
+        phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
         self.sessions.save(session)
+        phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+        if benchmark is not None:
+            benchmark.add_top_level_duration("session_save_duration_ms", (time.perf_counter() - started) * 1000)
+            benchmark.add_span(name="session_save", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+
+        started = time.perf_counter()
+        phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+        phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+        if benchmark is not None:
+            benchmark.add_top_level_duration("background_schedule_duration_ms", (time.perf_counter() - started) * 1000)
+            benchmark.add_span(name="background_schedule", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -563,10 +673,17 @@ class AgentLoop:
         meta = dict(msg.metadata or {})
         if on_stream is not None:
             meta["_streamed"] = True
-        return OutboundMessage(
+        started = time.perf_counter()
+        phase_start_ms = benchmark.now_ms() if benchmark is not None else 0.0
+        outbound = OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=meta,
         )
+        phase_end_ms = benchmark.now_ms() if benchmark is not None else 0.0
+        if benchmark is not None:
+            benchmark.add_top_level_duration("response_build_duration_ms", (time.perf_counter() - started) * 1000)
+            benchmark.add_span(name="response_build", category="top", start_ms=phase_start_ms, end_ms=phase_end_ms, tid=2)
+        return outbound
 
     @staticmethod
     def _image_placeholder(block: dict[str, Any]) -> dict[str, str]:
@@ -603,46 +720,33 @@ class AgentLoop:
                 filtered.append(self._image_placeholder(block))
                 continue
 
-            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                text = block["text"]
-                if truncate_text and len(text) > self._TOOL_RESULT_MAX_CHARS:
-                    text = text[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
-                filtered.append({**block, "text": text})
+            if block.get("type") == "input_image":
+                filtered.append(self._image_placeholder(block))
                 continue
 
-            filtered.append(block)
+            if truncate_text and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and len(text) > self._TOOL_RESULT_MAX_CHARS:
+                    trimmed = text[:self._TOOL_RESULT_MAX_CHARS]
+                    filtered.append({**block, "text": trimmed + "\n...[truncated]"})
+                    continue
 
+            filtered.append(block)
         return filtered
 
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
-        """Save new-turn messages into session, truncating large tool results."""
+    def _save_turn(self, session: Session, messages: list[dict], start_index: int) -> None:
         from datetime import datetime
-        for m in messages[skip:]:
-            entry = dict(m)
-            role, content = entry.get("role"), entry.get("content")
-            if role == "assistant" and not content and not entry.get("tool_calls"):
-                continue  # skip empty assistant messages — they poison session context
-            if role == "tool":
-                if isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                    entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
-                elif isinstance(content, list):
-                    filtered = self._sanitize_persisted_blocks(content, truncate_text=True)
-                    if not filtered:
-                        continue
-                    entry["content"] = filtered
-            elif role == "user":
-                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                    # Strip the runtime-context prefix, keep only the user text.
-                    parts = content.split("\n\n", 1)
-                    if len(parts) > 1 and parts[1].strip():
-                        entry["content"] = parts[1]
-                    else:
-                        continue
-                if isinstance(content, list):
-                    filtered = self._sanitize_persisted_blocks(content, drop_runtime=True)
-                    if not filtered:
-                        continue
-                    entry["content"] = filtered
+        for msg in messages[start_index:]:
+            entry = dict(msg)
+            if isinstance(entry.get("content"), list):
+                filtered = self._sanitize_persisted_blocks(
+                    entry["content"],
+                    truncate_text=entry.get("role") == "tool",
+                    drop_runtime=entry.get("role") == "system",
+                )
+                if not filtered:
+                    continue
+                entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
@@ -658,7 +762,13 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
+        started = time.perf_counter()
+        connect_start_ms = self._benchmark.now_ms() if self._benchmark is not None else 0.0
         await self._connect_mcp()
+        connect_end_ms = self._benchmark.now_ms() if self._benchmark is not None else 0.0
+        if self._benchmark is not None:
+            self._benchmark.add_top_level_duration("connect_mcp_duration_ms", (time.perf_counter() - started) * 1000)
+            self._benchmark.add_span(name="connect_mcp", category="top", start_ms=connect_start_ms, end_ms=connect_end_ms, tid=2)
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         return await self._process_message(
             msg, session_key=session_key, on_progress=on_progress,
