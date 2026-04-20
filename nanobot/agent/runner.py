@@ -118,7 +118,16 @@ class AgentRunner:
             llm_end_ms = spec.benchmark.now_ms() if spec.benchmark is not None else 0.0
             llm_duration_ms = (time.perf_counter() - llm_started) * 1000
             if spec.benchmark is not None:
+                output_tool_calls = [tc.to_openai_tool_call() for tc in response.tool_calls]
                 spec.benchmark.add_llm_duration(iteration, llm_duration_ms)
+                spec.benchmark.set_llm_exchange(
+                    iteration,
+                    input_messages=[dict(message) for message in messages],
+                    output_content=response.content,
+                    output_reasoning_content=response.reasoning_content,
+                    output_tool_calls=output_tool_calls,
+                    output_finish_reason=response.finish_reason,
+                )
                 spec.benchmark.add_span(
                     name="llm",
                     category="iteration_phase",
@@ -129,6 +138,8 @@ class AgentRunner:
                     args={
                         "model": spec.model,
                         "streaming": hook.wants_streaming(),
+                        "llm_input_text": spec.benchmark.ensure_iteration(iteration).llm_input_text,
+                        "llm_output_text": spec.benchmark.ensure_iteration(iteration).llm_output_text,
                     },
                 )
 
@@ -560,7 +571,7 @@ class AgentRunner:
                     "error",
                 )
                 spec.benchmark.add_span(
-                    name=tool_call.name,
+                    name=f"tool:{tool_call.name}",
                     category="tool",
                     start_ms=tool_start_ms,
                     end_ms=tool_end_ms,
@@ -594,7 +605,7 @@ class AgentRunner:
                 status,
             )
             spec.benchmark.add_span(
-                name=tool_call.name,
+                name=f"tool:{tool_call.name}",
                 category="tool",
                 start_ms=tool_start_ms,
                 end_ms=tool_end_ms,

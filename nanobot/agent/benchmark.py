@@ -10,6 +10,70 @@ from pathlib import Path
 from typing import Any
 
 
+def _safe_json_dumps(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except TypeError:
+        return json.dumps(str(value), ensure_ascii=False, indent=2)
+
+
+TOP_LEVEL_PHASE_SPECS: list[tuple[str, str, str]] = [
+    ("1.1", "run.connect_mcp", "connect_mcp_duration_ms"),
+    ("1.2", "run.session_load", "session_load_duration_ms"),
+    ("1.3", "run.command_dispatch", "command_dispatch_duration_ms"),
+    ("1.4", "run.memory_consolidation_before", "memory_consolidation_before_duration_ms"),
+    ("1.5", "run.tool_context_setup", "tool_context_setup_duration_ms"),
+    ("1.6", "run.turn_setup", "turn_setup_duration_ms"),
+    ("1.7", "run.context_build", "context_build_duration_ms"),
+    ("1.8", "run.agent_loop", "agent_loop_duration_ms"),
+    ("1.9", "run.save_turn", "save_turn_duration_ms"),
+    ("1.10", "run.session_save", "session_save_duration_ms"),
+    ("1.11", "run.background_schedule", "background_schedule_duration_ms"),
+    ("1.12", "run.response_build", "response_build_duration_ms"),
+    ("1.13", "run.framework_overhead", "framework_overhead_duration_ms"),
+]
+
+ITERATION_PHASE_SPECS: list[tuple[str, str, str]] = [
+    ("2.1", "iteration.llm", "llm_duration_ms"),
+    ("2.2", "iteration.tools_wall_clock", "tools_wall_clock_duration_ms"),
+    ("2.3", "iteration.hook.before_iteration", "hook_before_iteration_duration_ms"),
+    ("2.4", "iteration.hook.before_execute_tools", "hook_before_execute_tools_duration_ms"),
+    ("2.5", "iteration.hook.after_iteration", "hook_after_iteration_duration_ms"),
+    ("2.6", "iteration.message_build.assistant", "message_build_assistant_duration_ms"),
+    ("2.7", "iteration.message_build.tool_results", "message_build_tool_results_duration_ms"),
+    ("2.8", "iteration.finalize_content", "finalize_content_duration_ms"),
+    ("2.9", "iteration.framework_overhead", "framework_overhead_duration_ms"),
+]
+
+SPAN_SPECS: dict[str, tuple[str, str]] = {
+    "run": ("1", "run"),
+    "connect_mcp": ("1.1", "run.connect_mcp"),
+    "session_load": ("1.2", "run.session_load"),
+    "command_dispatch": ("1.3", "run.command_dispatch"),
+    "memory_consolidation_before": ("1.4", "run.memory_consolidation_before"),
+    "tool_context_setup": ("1.5", "run.tool_context_setup"),
+    "turn_setup": ("1.6", "run.turn_setup"),
+    "context_build": ("1.7", "run.context_build"),
+    "agent_loop": ("1.8", "run.agent_loop"),
+    "save_turn": ("1.9", "run.save_turn"),
+    "session_save": ("1.10", "run.session_save"),
+    "background_schedule": ("1.11", "run.background_schedule"),
+    "response_build": ("1.12", "run.response_build"),
+    "top_framework_overhead": ("1.13", "run.framework_overhead"),
+    "iteration": ("2", "iteration"),
+    "hook_before_iteration": ("2.3", "iteration.hook.before_iteration"),
+    "llm": ("2.1", "iteration.llm"),
+    "message_build_assistant": ("2.6", "iteration.message_build.assistant"),
+    "hook_before_execute_tools": ("2.4", "iteration.hook.before_execute_tools"),
+    "tools_wall_clock": ("2.2", "iteration.tools_wall_clock"),
+    "message_build_tool_results": ("2.7", "iteration.message_build.tool_results"),
+    "finalize_content": ("2.8", "iteration.finalize_content"),
+    "hook_after_iteration": ("2.5", "iteration.hook.after_iteration"),
+    "iteration_framework_overhead": ("2.9", "iteration.framework_overhead"),
+    "tool": ("3", "tool"),
+}
+
+
 @dataclass(slots=True)
 class ToolBenchmarkRecord:
     iteration: int
@@ -36,6 +100,13 @@ class IterationBenchmarkRecord:
     total_duration_ms: float = 0.0
     finish_reason: str | None = None
     stop_reason: str | None = None
+    llm_input_messages: list[dict[str, Any]] = field(default_factory=list)
+    llm_input_text: str = ""
+    llm_output_content: str | None = None
+    llm_output_reasoning_content: str | None = None
+    llm_output_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    llm_output_finish_reason: str | None = None
+    llm_output_text: str = ""
 
 
 @dataclass(slots=True)
@@ -49,6 +120,9 @@ class SpanRecord:
     tid: int = 1
     iteration: int | None = None
     status: str | None = None
+    level: str | None = None
+    path: str | None = None
+    display_name: str | None = None
     args: dict[str, Any] = field(default_factory=dict)
 
 
@@ -163,6 +237,25 @@ class BenchmarkTrace:
             args=args,
         )
 
+    @staticmethod
+    def _normalize_span_name(name: str, iteration: int | None = None) -> tuple[str | None, str | None, str]:
+        if name.startswith("iteration_"):
+            suffix = name.split("_", 1)[1]
+            level, path = SPAN_SPECS["iteration"]
+            display = f"{level} iteration[{suffix}]"
+            return level, path, display
+        if name.startswith("tool:"):
+            tool_name = name.split(":", 1)[1]
+            level, path = SPAN_SPECS["tool"]
+            display = f"{level} tool.{tool_name}"
+            return level, path, display
+        spec = SPAN_SPECS.get(name)
+        if spec is None:
+            return None, None, name
+        level, path = spec
+        display = f"{level} {path}"
+        return level, path, display
+
     def add_span(
         self,
         *,
@@ -179,6 +272,7 @@ class BenchmarkTrace:
         start_ms = self._r(start_ms)
         end_ms = self._r(end_ms)
         duration_ms = self._r(max(0.0, end_ms - start_ms))
+        level, path, display_name = self._normalize_span_name(name, iteration=iteration)
         self.spans.append(SpanRecord(
             name=name,
             category=category,
@@ -189,6 +283,9 @@ class BenchmarkTrace:
             tid=tid,
             iteration=iteration,
             status=status,
+            level=level,
+            path=path,
+            display_name=display_name,
             args=dict(args or {}),
         ))
 
@@ -221,6 +318,30 @@ class BenchmarkTrace:
     def add_llm_duration(self, iteration: int, duration_ms: float) -> None:
         item = self.ensure_iteration(iteration)
         item.llm_duration_ms = self._r(duration_ms)
+
+    def set_llm_exchange(
+        self,
+        iteration: int,
+        *,
+        input_messages: list[dict[str, Any]],
+        output_content: str | None,
+        output_reasoning_content: str | None,
+        output_tool_calls: list[dict[str, Any]],
+        output_finish_reason: str | None,
+    ) -> None:
+        item = self.ensure_iteration(iteration)
+        item.llm_input_messages = input_messages
+        item.llm_input_text = _safe_json_dumps(input_messages)
+        item.llm_output_content = output_content
+        item.llm_output_reasoning_content = output_reasoning_content
+        item.llm_output_tool_calls = output_tool_calls
+        item.llm_output_finish_reason = output_finish_reason
+        item.llm_output_text = _safe_json_dumps({
+            "content": output_content,
+            "reasoning_content": output_reasoning_content,
+            "tool_calls": output_tool_calls,
+            "finish_reason": output_finish_reason,
+        })
 
     def add_tool_record(self, iteration: int, name: str, duration_ms: float, status: str) -> None:
         self.tools.append(ToolBenchmarkRecord(
@@ -310,9 +431,62 @@ class BenchmarkTrace:
     def iteration_framework_overhead_total_duration_ms(self) -> float:
         return self._r(sum(item.framework_overhead_duration_ms for item in self.iterations))
 
+    def hierarchy_dict(self) -> dict[str, Any]:
+        top_children = [
+            {
+                "level": level,
+                "path": path,
+                "field": field,
+                "duration_ms": getattr(self, field),
+            }
+            for level, path, field in TOP_LEVEL_PHASE_SPECS
+        ]
+        iteration_children = [
+            {
+                "level": level,
+                "path": path,
+                "field": field,
+            }
+            for level, path, field in ITERATION_PHASE_SPECS
+        ]
+        return {
+            "1": {
+                "path": "run",
+                "duration_ms": self._r(self.total_duration_ms),
+                "children": top_children,
+            },
+            "2": {
+                "path": "iteration",
+                "count": len(self.iterations),
+                "children": iteration_children,
+            },
+            "3": {
+                "path": "tool",
+                "count": len(self.tools),
+            },
+        }
+
     def summary_dict(self) -> dict[str, Any]:
+        top_level_breakdown = {
+            level: {
+                "path": path,
+                "field": field,
+                "duration_ms": getattr(self, field),
+            }
+            for level, path, field in TOP_LEVEL_PHASE_SPECS
+        }
+        iteration_breakdown = {
+            level: {
+                "path": path,
+                "field": field,
+                "total_duration_ms": self._r(sum(getattr(item, field) for item in self.iterations)),
+            }
+            for level, path, field in ITERATION_PHASE_SPECS
+        }
         return {
             "session_key": self.session_key,
+            "hierarchy_version": 1,
+            "level_1": "run",
             "total_duration_ms": self._r(self.total_duration_ms),
             "accounted_total_duration_ms": self._r(self.accounted_total_duration_ms),
             "framework_overhead_duration_ms": self._r(self.framework_overhead_duration_ms),
@@ -335,22 +509,26 @@ class BenchmarkTrace:
             "iteration_framework_overhead_total_duration_ms": self.iteration_framework_overhead_total_duration_ms,
             "tool_call_count": len(self.tools),
             "span_count": len(self.spans),
+            "llm_input_char_total": sum(len(item.llm_input_text) for item in self.iterations),
+            "llm_output_char_total": sum(len(item.llm_output_text) for item in self.iterations),
+            "hierarchy": self.hierarchy_dict(),
+            "top_level_breakdown": top_level_breakdown,
+            "iteration_breakdown": iteration_breakdown,
         }
 
     def summary_text(self) -> str:
         data = self.summary_dict()
+        top = data["top_level_breakdown"]
         return (
             "benchmark summary: "
-            f"total={data['total_duration_ms']:.3f}ms, "
-            f"accounted={data['accounted_total_duration_ms']:.3f}ms, "
-            f"top_overhead={data['framework_overhead_duration_ms']:.3f}ms, "
-            f"context_build={data['context_build_duration_ms']:.3f}ms, "
-            f"agent_loop={data['agent_loop_duration_ms']:.3f}ms, "
-            f"iterations={data['iterations']}, "
-            f"llm={data['llm_total_duration_ms']:.3f}ms, "
-            f"tools_sum={data['tools_total_duration_ms']:.3f}ms, "
-            f"tools_wall={data['tools_wall_clock_total_duration_ms']:.3f}ms, "
-            f"tool_calls={data['tool_call_count']}, "
+            f"1 run.total={data['total_duration_ms']:.3f}ms, "
+            f"1.7 run.context_build={top['1.7']['duration_ms']:.3f}ms, "
+            f"1.8 run.agent_loop={top['1.8']['duration_ms']:.3f}ms, "
+            f"1.13 run.framework_overhead={top['1.13']['duration_ms']:.3f}ms, "
+            f"2 iteration.count={data['iterations']}, "
+            f"2.1 iteration.llm.total={data['llm_total_duration_ms']:.3f}ms, "
+            f"2.2 iteration.tools_wall_clock.total={data['tools_wall_clock_total_duration_ms']:.3f}ms, "
+            f"3 tool.count={data['tool_call_count']}, "
             f"spans={data['span_count']}"
         )
 
@@ -386,9 +564,15 @@ class BenchmarkTrace:
                 args.setdefault("iteration", span.iteration)
             if span.status is not None:
                 args.setdefault("status", span.status)
+            if span.level is not None:
+                args.setdefault("level", span.level)
+            if span.path is not None:
+                args.setdefault("path", span.path)
+            if span.display_name is not None:
+                args.setdefault("display_name", span.display_name)
             args.setdefault("duration_ms", span.duration_ms)
             events.append({
-                "name": span.name,
+                "name": span.display_name or span.name,
                 "cat": span.category,
                 "ph": "X",
                 "ts": self._us_from_ms(span.start_ms),

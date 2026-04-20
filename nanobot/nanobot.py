@@ -106,8 +106,10 @@ class Nanobot:
         """
         prev = self._loop._extra_hooks
         benchmark = BenchmarkTrace()
+        run_start_ms = 0.0
         if benchmark_enabled():
             benchmark.start(session_key=session_key)
+            run_start_ms = benchmark.now_ms()
         else:
             benchmark = None
         if hooks is not None:
@@ -124,6 +126,13 @@ class Nanobot:
 
         if benchmark is not None:
             benchmark.finish()
+            benchmark.add_span(
+                name="run",
+                category="run",
+                start_ms=run_start_ms,
+                end_ms=benchmark.total_duration_ms,
+                tid=1,
+            )
             trace_path = benchmark_trace_path()
             if trace_path:
                 benchmark.write_json(trace_path)
