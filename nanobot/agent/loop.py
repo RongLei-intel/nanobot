@@ -296,7 +296,7 @@ class AgentLoop:
     async def _process_message(self, msg: InboundMessage, session_key: str | None = None, on_progress: Callable[[str], Awaitable[None]] | None = None, on_stream: Callable[[str], Awaitable[None]] | None = None, on_stream_end: Callable[..., Awaitable[None]] | None = None) -> OutboundMessage | None:
         prof = self._profiler
         if msg.channel == "system":
-            prof.push("Prepare before agent loop")
+            prof.push("prepare_before_agent_loop")
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id))
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
@@ -310,7 +310,7 @@ class AgentLoop:
             prof.push("agent_loop")
             final_content, _, all_msgs = await self._run_agent_loop(messages, channel=channel, chat_id=chat_id, message_id=msg.metadata.get("message_id"))
             prof.pop()
-            prof.push("Session end")
+            prof.push("session_end")
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
@@ -347,7 +347,7 @@ class AgentLoop:
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, on_progress=on_progress or _bus_progress, on_stream=on_stream, on_stream_end=on_stream_end, channel=msg.channel, chat_id=msg.chat_id, message_id=msg.metadata.get("message_id"))
         prof.pop()
 
-        prof.push("Session_end")
+        prof.push("session_end")
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
         self._save_turn(session, all_msgs, 1 + len(history))
@@ -408,7 +408,7 @@ class AgentLoop:
 
     async def process_direct(self, content: str, session_key: str = "cli:direct", channel: str = "cli", chat_id: str = "direct", on_progress: Callable[[str], Awaitable[None]] | None = None, on_stream: Callable[[str], Awaitable[None]] | None = None, on_stream_end: Callable[..., Awaitable[None]] | None = None) -> OutboundMessage | None:
         prof = self._profiler
-        prof.push("run", category="run")
+        prof.push("run", category="mainloop")
         prof.push("connect_mcp")
         await self._connect_mcp()
         prof.pop()

@@ -64,9 +64,8 @@ class AgentRunner:
         tool_events: list[dict[str, str]] = []
 
         for iteration in range(spec.max_iterations):
+            prof.push("iteration_start", category="mainloop")
             context = AgentHookContext(iteration=iteration, messages=messages, profiler=prof)
-
-            prof.push(f"iteration[{iteration}]", category="iteration", iteration=iteration, tid=10)
             await hook.before_iteration(context)
 
             kwargs: dict[str, Any] = {"messages": messages, "tools": spec.tools.get_definitions(), "model": spec.model}
@@ -77,7 +76,7 @@ class AgentRunner:
             if spec.reasoning_effort is not None:
                 kwargs["reasoning_effort"] = spec.reasoning_effort
 
-            prof.push("llm", category="iteration_phase", iteration=iteration, tid=10)
+            prof.push("llm_call", category="model")
             if hook.wants_streaming():
                 async def _stream(delta: str) -> None:
                     await hook.on_stream(context, delta)
@@ -86,7 +85,6 @@ class AgentRunner:
                 response = await self.provider.chat_with_retry(**kwargs)
             prof.pop(args={
                 "model": spec.model,
-                "streaming": hook.wants_streaming(),
                 "messages": messages,
                 "response": response,
             })
@@ -98,12 +96,14 @@ class AgentRunner:
             context.tool_calls = list(response.tool_calls)
 
             if response.has_tool_calls:
+                prof.push("tool_calls")
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=True)
                 messages.append(build_assistant_message(response.content or "", tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls], reasoning_content=response.reasoning_content, thinking_blocks=response.thinking_blocks))
                 tools_used.extend(tc.name for tc in response.tool_calls)
                 await hook.before_execute_tools(context)
                 results, new_events, fatal_error = await self._execute_tools(spec, iteration, response.tool_calls)
+                prof.pop(args={"tool_calls": response.tool_calls})
                 tool_events.extend(new_events)
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
@@ -113,12 +113,12 @@ class AgentRunner:
                     context.error = error
                     context.stop_reason = stop_reason
                     await hook.after_iteration(context)
-                    prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason, "tool_count": len(response.tool_calls)})
+                    prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason})
                     break
                 for tool_call, result in zip(response.tool_calls, results):
                     messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.name, "content": result})
                 await hook.after_iteration(context)
-                prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": "tool_calls", "tool_count": len(response.tool_calls)})
+                prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": "tool_calls"})
                 continue
 
             if hook.wants_streaming():
@@ -132,7 +132,7 @@ class AgentRunner:
                 context.error = error
                 context.stop_reason = stop_reason
                 await hook.after_iteration(context)
-                prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason, "tool_count": 0})
+                prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason})
                 break
 
             messages.append(build_assistant_message(clean, reasoning_content=response.reasoning_content, thinking_blocks=response.thinking_blocks))
@@ -140,7 +140,7 @@ class AgentRunner:
             context.final_content = final_content
             context.stop_reason = stop_reason
             await hook.after_iteration(context)
-            prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason, "tool_count": 0})
+            prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason})
             break
         else:
             stop_reason = "max_iterations"
@@ -150,12 +150,11 @@ class AgentRunner:
 
     async def _execute_tools(self, spec: AgentRunSpec, iteration: int, tool_calls: list[ToolCallRequest]) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         prof = spec.profiler
-        prof.push("tools_wall_clock", category="iteration_phase", iteration=iteration, tid=10, args={"tool_count": len(tool_calls), "concurrent": spec.concurrent_tools})
+        prof.push("execute_tools", category="tool")
         if spec.concurrent_tools:
             tool_results = await asyncio.gather(*(self._run_tool(spec, iteration, tool_call) for tool_call in tool_calls))
         else:
             tool_results = [await self._run_tool(spec, iteration, tool_call) for tool_call in tool_calls]
-        prof.pop()
         results: list[Any] = []
         events: list[dict[str, str]] = []
         fatal_error: BaseException | None = None
@@ -164,11 +163,12 @@ class AgentRunner:
             events.append(event)
             if error is not None and fatal_error is None:
                 fatal_error = error
+        prof.pop(args={"tool_count": len(tool_calls), "concurrent": spec.concurrent_tools})
         return results, events, fatal_error
 
     async def _run_tool(self, spec: AgentRunSpec, iteration: int, tool_call: ToolCallRequest) -> tuple[Any, dict[str, str], BaseException | None]:
         prof = spec.profiler
-        prof.push(tool_call.name, category="tool", iteration=iteration, tid=20)
+        prof.push(tool_call.name, category="tool")
         try:
             result = await spec.tools.execute(tool_call.name, tool_call.arguments)
         except asyncio.CancelledError:
