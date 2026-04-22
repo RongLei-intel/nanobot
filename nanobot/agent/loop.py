@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
-from nanobot.agent.benchmark import BenchmarkTrace
+from nanobot.utils.profiler import ProfilerTrace
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import MemoryConsolidator
@@ -136,7 +136,7 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
-        self._benchmark = BenchmarkTrace.create()
+        self._profiler = ProfilerTrace()
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
@@ -219,7 +219,7 @@ class AgentLoop:
     async def _run_agent_loop(self, initial_messages: list[dict], on_progress: Callable[..., Awaitable[None]] | None = None, on_stream: Callable[[str], Awaitable[None]] | None = None, on_stream_end: Callable[..., Awaitable[None]] | None = None, *, channel: str = "cli", chat_id: str = "direct", message_id: str | None = None) -> tuple[str | None, list[str], list[dict]]:
         loop_hook = _LoopHook(self, on_progress=on_progress, on_stream=on_stream, on_stream_end=on_stream_end, channel=channel, chat_id=chat_id, message_id=message_id)
         hook: AgentHook = _LoopHookChain(loop_hook, self._extra_hooks) if self._extra_hooks else loop_hook
-        result = await self.runner.run(AgentRunSpec(initial_messages=initial_messages, tools=self.tools, model=self.model, max_iterations=self.max_iterations, hook=hook, error_message="Sorry, I encountered an error calling the AI model.", concurrent_tools=True, benchmark=self._benchmark))
+        result = await self.runner.run(AgentRunSpec(initial_messages=initial_messages, tools=self.tools, model=self.model, max_iterations=self.max_iterations, hook=hook, error_message="Sorry, I encountered an error calling the AI model.", concurrent_tools=True, profiler=self._profiler))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
@@ -294,9 +294,9 @@ class AgentLoop:
         task.add_done_callback(self._background_tasks.remove)
 
     async def _process_message(self, msg: InboundMessage, session_key: str | None = None, on_progress: Callable[[str], Awaitable[None]] | None = None, on_stream: Callable[[str], Awaitable[None]] | None = None, on_stream_end: Callable[..., Awaitable[None]] | None = None) -> OutboundMessage | None:
-        bench = self._benchmark
+        prof = self._profiler
         if msg.channel == "system":
-            bench.push("Prepare before agent loop")
+            prof.push("Prepare before agent loop")
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id))
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
@@ -306,19 +306,19 @@ class AgentLoop:
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(history=history, current_message=msg.content, channel=channel, chat_id=chat_id, current_role=current_role)
-            bench.pop()
-            bench.push("agent_loop")
+            prof.pop()
+            prof.push("agent_loop")
             final_content, _, all_msgs = await self._run_agent_loop(messages, channel=channel, chat_id=chat_id, message_id=msg.metadata.get("message_id"))
-            bench.pop()
-            bench.push("Session end")
+            prof.pop()
+            prof.push("Session end")
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
             outbound = OutboundMessage(channel=channel, chat_id=chat_id, content=final_content or "Background task completed.")
-            bench.pop()
+            prof.pop()
             return outbound
 
-        bench.push("prepare_before_agent_loop")
+        prof.push("prepare_before_agent_loop")
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
         key = session_key or msg.session_key
@@ -335,7 +335,7 @@ class AgentLoop:
                 message_tool.start_turn()
         history = session.get_history(max_messages=0)
         initial_messages = self.context.build_messages(history=history, current_message=msg.content, media=msg.media if msg.media else None, channel=msg.channel, chat_id=msg.chat_id)
-        bench.pop()
+        prof.pop()
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
@@ -343,18 +343,18 @@ class AgentLoop:
             meta["_tool_hint"] = tool_hint
             await self.bus.publish_outbound(OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta))
 
-        bench.push("agent_loop")
+        prof.push("agent_loop")
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, on_progress=on_progress or _bus_progress, on_stream=on_stream, on_stream_end=on_stream_end, channel=msg.channel, chat_id=msg.chat_id, message_id=msg.metadata.get("message_id"))
-        bench.pop()
+        prof.pop()
 
-        bench.push("Session_end")
+        prof.push("Session_end")
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            bench.pop()
+            prof.pop()
             return None
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
@@ -362,7 +362,7 @@ class AgentLoop:
         if on_stream is not None:
             meta["_streamed"] = True
         outbound = OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=final_content, metadata=meta)
-        bench.pop()
+        prof.pop()
         return outbound
 
     @staticmethod
@@ -407,12 +407,12 @@ class AgentLoop:
         session.updated_at = datetime.now()
 
     async def process_direct(self, content: str, session_key: str = "cli:direct", channel: str = "cli", chat_id: str = "direct", on_progress: Callable[[str], Awaitable[None]] | None = None, on_stream: Callable[[str], Awaitable[None]] | None = None, on_stream_end: Callable[..., Awaitable[None]] | None = None) -> OutboundMessage | None:
-        bench = self._benchmark
-        bench.push("run", category="run")
-        bench.push("connect_mcp")
+        prof = self._profiler
+        prof.push("run", category="run")
+        prof.push("connect_mcp")
         await self._connect_mcp()
-        bench.pop()
+        prof.pop()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress, on_stream=on_stream, on_stream_end=on_stream_end)
-        bench.pop()
+        prof.pop()
         return response

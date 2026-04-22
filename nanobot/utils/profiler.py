@@ -1,4 +1,4 @@
-"""Benchmark instrumentation for nanobot agent runs."""
+"""Profiler instrumentation for nanobot runs."""
 
 from __future__ import annotations
 
@@ -96,8 +96,10 @@ class TreeNode:
         }
 
 
-class BenchmarkTrace:
-    def __init__(self, enabled: bool = False) -> None:
+class ProfilerTrace:
+    def __init__(self, enabled: bool | None = None) -> None:
+        if enabled is None:
+            enabled = profiler_enabled()
         self.enabled = enabled
         self.session_key: str | None = None
         self.started_at: float = 0.0
@@ -108,18 +110,14 @@ class BenchmarkTrace:
         self.spans: list[SpanRecord] = []
         self._stack: list[ActiveBucket] = []
 
-    @classmethod
-    def create(cls) -> "BenchmarkTrace":
-        return cls(enabled=benchmark_enabled())
-
-    def start(self, session_key: str | None = None) -> "BenchmarkTrace":
+    def start(self, session_key: str | None = None) -> "ProfilerTrace":
         if not self.enabled:
             return self
         self.session_key = session_key
         self.started_at = time.perf_counter()
         return self
 
-    def finish(self) -> "BenchmarkTrace":
+    def finish(self) -> "ProfilerTrace":
         if not self.enabled:
             return self
         while self._stack:
@@ -136,13 +134,13 @@ class BenchmarkTrace:
             return 0.0
         return self._r((time.perf_counter() - self.started_at) * 1000)
 
-    def push(self, name: str, *, category: str = "phase", iteration: int | None = None, status: str | None = None, args: dict[str, Any] | None = None, pid: int = 1, tid: int = 1) -> "BenchmarkTrace":
+    def push(self, name: str, *, category: str = "phase", iteration: int | None = None, status: str | None = None, args: dict[str, Any] | None = None, pid: int = 1, tid: int = 1) -> "ProfilerTrace":
         if not self.enabled:
             return self
         self._stack.append(ActiveBucket(name=name, start_ms=self.now_ms(), category=category, iteration=iteration, status=status, args=dict(args or {}), pid=pid, tid=tid))
         return self
 
-    def pop(self, *, status: str | None = None, args: dict[str, Any] | None = None) -> "BenchmarkTrace":
+    def pop(self, *, status: str | None = None, args: dict[str, Any] | None = None) -> "ProfilerTrace":
         if not self.enabled or not self._stack:
             return self
         active = self._stack.pop()
@@ -344,7 +342,7 @@ class BenchmarkTrace:
         top_items = sorted(phase_totals.items(), key=lambda kv: kv[1], reverse=True)[:5]
         top_text = ", ".join(f"{name}={value:.3f}ms" for name, value in top_items)
         return (
-            "benchmark summary: "
+            "profiler summary: "
             f"run.total={data['total_duration_ms']:.3f}ms, "
             f"iterations={data['iterations']}, "
             f"llm_total={data['llm_total_duration_ms']:.3f}ms, "
@@ -389,7 +387,7 @@ class BenchmarkTrace:
 
     def write_json(self, path: str | Path=None) -> Path:
         if path is None:
-            path = benchmark_trace_path()
+            path = profiler_trace_path()
         target = Path(path).expanduser().resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -397,7 +395,7 @@ class BenchmarkTrace:
 
     def write_perfetto_json(self, path: str | Path=None) -> Path:
         if path is None:
-            path = benchmark_perfetto_trace_path()
+            path = profiler_perfetto_trace_path()
         target = Path(path).expanduser().resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(self.to_perfetto_dict(), ensure_ascii=False), encoding="utf-8")
@@ -416,16 +414,16 @@ class BenchmarkTrace:
         return "/".join(item.name for item in stack)
 
 
-def benchmark_enabled() -> bool:
-    value = os.environ.get("NANOBOT_BENCHMARK", "").strip().lower()
+def profiler_enabled() -> bool:
+    value = os.environ.get("NANOBOT_PROFILER", "").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 
-def benchmark_trace_path() -> str | None:
-    value = os.environ.get("NANOBOT_BENCHMARK_TRACE", "").strip()
+def profiler_trace_path() -> str | None:
+    value = os.environ.get("NANOBOT_PROFILER_TRACE", "").strip()
     return value or None
 
 
-def benchmark_perfetto_trace_path() -> str | None:
-    value = os.environ.get("NANOBOT_BENCHMARK_PERFETTO_TRACE", "").strip()
+def profiler_perfetto_trace_path() -> str | None:
+    value = os.environ.get("NANOBOT_PROFILER_PERFETTO_TRACE", "").strip()
     return value or None

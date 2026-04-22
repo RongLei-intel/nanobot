@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-from nanobot.agent.benchmark import BenchmarkTrace
+from nanobot.utils.profiler import ProfilerTrace
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, ToolCallRequest
@@ -33,7 +33,7 @@ class AgentRunSpec:
     max_iterations_message: str | None = None
     concurrent_tools: bool = False
     fail_on_tool_error: bool = False
-    benchmark: BenchmarkTrace = field(default_factory=BenchmarkTrace.create)
+    profiler: ProfilerTrace = field(default_factory=ProfilerTrace)
 
 
 @dataclass(slots=True)
@@ -45,7 +45,7 @@ class AgentRunResult:
     stop_reason: str = "completed"
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
-    benchmark: BenchmarkTrace | None = None
+    profiler: ProfilerTrace | None = None
 
 
 class AgentRunner:
@@ -54,7 +54,7 @@ class AgentRunner:
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
-        bench = spec.benchmark
+        prof = spec.profiler
         messages = list(spec.initial_messages)
         final_content: str | None = None
         tools_used: list[str] = []
@@ -64,9 +64,9 @@ class AgentRunner:
         tool_events: list[dict[str, str]] = []
 
         for iteration in range(spec.max_iterations):
-            context = AgentHookContext(iteration=iteration, messages=messages, benchmark=bench)
+            context = AgentHookContext(iteration=iteration, messages=messages, profiler=prof)
 
-            bench.push(f"iteration[{iteration}]", category="iteration", iteration=iteration, tid=10)
+            prof.push(f"iteration[{iteration}]", category="iteration", iteration=iteration, tid=10)
             await hook.before_iteration(context)
 
             kwargs: dict[str, Any] = {"messages": messages, "tools": spec.tools.get_definitions(), "model": spec.model}
@@ -77,14 +77,14 @@ class AgentRunner:
             if spec.reasoning_effort is not None:
                 kwargs["reasoning_effort"] = spec.reasoning_effort
 
-            bench.push("llm", category="iteration_phase", iteration=iteration, tid=10)
+            prof.push("llm", category="iteration_phase", iteration=iteration, tid=10)
             if hook.wants_streaming():
                 async def _stream(delta: str) -> None:
                     await hook.on_stream(context, delta)
                 response = await self.provider.chat_stream_with_retry(**kwargs, on_content_delta=_stream)
             else:
                 response = await self.provider.chat_with_retry(**kwargs)
-            bench.pop(args={
+            prof.pop(args={
                 "model": spec.model,
                 "streaming": hook.wants_streaming(),
                 "messages": messages,
@@ -113,12 +113,12 @@ class AgentRunner:
                     context.error = error
                     context.stop_reason = stop_reason
                     await hook.after_iteration(context)
-                    bench.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason, "tool_count": len(response.tool_calls)})
+                    prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason, "tool_count": len(response.tool_calls)})
                     break
                 for tool_call, result in zip(response.tool_calls, results):
                     messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.name, "content": result})
                 await hook.after_iteration(context)
-                bench.pop(args={"finish_reason": response.finish_reason, "stop_reason": "tool_calls", "tool_count": len(response.tool_calls)})
+                prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": "tool_calls", "tool_count": len(response.tool_calls)})
                 continue
 
             if hook.wants_streaming():
@@ -132,7 +132,7 @@ class AgentRunner:
                 context.error = error
                 context.stop_reason = stop_reason
                 await hook.after_iteration(context)
-                bench.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason, "tool_count": 0})
+                prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason, "tool_count": 0})
                 break
 
             messages.append(build_assistant_message(clean, reasoning_content=response.reasoning_content, thinking_blocks=response.thinking_blocks))
@@ -140,22 +140,22 @@ class AgentRunner:
             context.final_content = final_content
             context.stop_reason = stop_reason
             await hook.after_iteration(context)
-            bench.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason, "tool_count": 0})
+            prof.pop(args={"finish_reason": response.finish_reason, "stop_reason": stop_reason, "tool_count": 0})
             break
         else:
             stop_reason = "max_iterations"
             final_content = (spec.max_iterations_message or _DEFAULT_MAX_ITERATIONS_MESSAGE).format(max_iterations=spec.max_iterations)
 
-        return AgentRunResult(final_content=final_content, messages=messages, tools_used=tools_used, usage=usage, stop_reason=stop_reason, error=error, tool_events=tool_events, benchmark=bench)
+        return AgentRunResult(final_content=final_content, messages=messages, tools_used=tools_used, usage=usage, stop_reason=stop_reason, error=error, tool_events=tool_events, profiler=prof)
 
     async def _execute_tools(self, spec: AgentRunSpec, iteration: int, tool_calls: list[ToolCallRequest]) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
-        bench = spec.benchmark
-        bench.push("tools_wall_clock", category="iteration_phase", iteration=iteration, tid=10, args={"tool_count": len(tool_calls), "concurrent": spec.concurrent_tools})
+        prof = spec.profiler
+        prof.push("tools_wall_clock", category="iteration_phase", iteration=iteration, tid=10, args={"tool_count": len(tool_calls), "concurrent": spec.concurrent_tools})
         if spec.concurrent_tools:
             tool_results = await asyncio.gather(*(self._run_tool(spec, iteration, tool_call) for tool_call in tool_calls))
         else:
             tool_results = [await self._run_tool(spec, iteration, tool_call) for tool_call in tool_calls]
-        bench.pop()
+        prof.pop()
         results: list[Any] = []
         events: list[dict[str, str]] = []
         fatal_error: BaseException | None = None
@@ -167,15 +167,15 @@ class AgentRunner:
         return results, events, fatal_error
 
     async def _run_tool(self, spec: AgentRunSpec, iteration: int, tool_call: ToolCallRequest) -> tuple[Any, dict[str, str], BaseException | None]:
-        bench = spec.benchmark
-        bench.push(tool_call.name, category="tool", iteration=iteration, tid=20)
+        prof = spec.profiler
+        prof.push(tool_call.name, category="tool", iteration=iteration, tid=20)
         try:
             result = await spec.tools.execute(tool_call.name, tool_call.arguments)
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
             event = {"name": tool_call.name, "status": "error", "detail": str(exc)}
-            bench.pop(status="error", args={"tool_call": tool_call, "error": exc})
+            prof.pop(status="error", args={"tool_call": tool_call, "error": exc})
             if spec.fail_on_tool_error:
                 return f"Error: {type(exc).__name__}: {exc}", event, exc
             return f"Error: {type(exc).__name__}: {exc}", event, None
@@ -186,6 +186,6 @@ class AgentRunner:
         elif len(detail) > 120:
             detail = detail[:120] + "..."
         status = "error" if isinstance(result, str) and result.startswith("Error") else "ok"
-        bench.pop(status=status, args={"tool_call": tool_call, "result": result})
+        prof.pop(status=status, args={"tool_call": tool_call, "result": result})
         return result, {"name": tool_call.name, "status": status, "detail": detail}, None
 

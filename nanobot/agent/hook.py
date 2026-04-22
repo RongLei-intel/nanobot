@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from nanobot.agent.benchmark import BenchmarkTrace
+from nanobot.utils.profiler import ProfilerTrace
 
 from loguru import logger
 
@@ -26,7 +26,7 @@ class AgentHookContext:
     final_content: str | None = None
     stop_reason: str | None = None
     error: str | None = None
-    benchmark: BenchmarkTrace | None = None
+    profiler: ProfilerTrace | None = None
 
 
 class AgentHook:

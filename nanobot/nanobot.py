@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.benchmark import BenchmarkTrace
+from nanobot.utils.profiler import ProfilerTrace
 from nanobot.agent.hook import AgentHook
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
@@ -17,7 +17,7 @@ class RunResult:
     content: str
     tools_used: list[str]
     messages: list[dict[str, Any]]
-    benchmark: BenchmarkTrace
+    profiler: ProfilerTrace
 
 
 class Nanobot:
@@ -44,17 +44,17 @@ class Nanobot:
 
     async def run(self, message: str, *, session_key: str = "sdk:default", hooks: list[AgentHook] | None = None) -> RunResult:
         prev = self._loop._extra_hooks
-        bench = BenchmarkTrace.create().start(session_key=session_key)
+        prof = ProfilerTrace().start(session_key=session_key)
         if hooks is not None:
             self._loop._extra_hooks = list(hooks)
-        self._loop._benchmark = bench
+        self._loop._profiler = prof
         try:
             response = await self._loop.process_direct(message, session_key=session_key)
         finally:
             self._loop._extra_hooks = prev
-        bench.finish()
+        prof.finish()
         content = (response.content if response else None) or ""
-        return RunResult(content=content, tools_used=(response.tools_used if response else []) if hasattr(response, "tools_used") else [], messages=(response.messages if response else []) if hasattr(response, "messages") else [], benchmark=bench)
+        return RunResult(content=content, tools_used=(response.tools_used if response else []) if hasattr(response, "tools_used") else [], messages=(response.messages if response else []) if hasattr(response, "messages") else [], profiler=prof)
 
 
 def _make_provider(config: Any) -> Any:
