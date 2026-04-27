@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import os
+import re
 import secrets
 import string
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import json_repair
+from loguru import logger
 from openai import AsyncOpenAI
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -31,6 +37,12 @@ _DEFAULT_OPENROUTER_HEADERS = {
     "X-OpenRouter-Title": "nanobot",
     "X-OpenRouter-Categories": "cli-agent,personal-agent",
 }
+_REPLAY_TAG_RE = re.compile(r"\[replay:([^\]]+)\]")
+
+_current_recorded_session_storage_dir_name: str | None = None
+# map session_key and its current iteration index during replay
+_current_replayed_iteration_index_mappings = {}
+_recorded_sessions: dict[str, list[dict[str, Any]]] = {}
 
 
 def _short_tool_id() -> str:
@@ -99,6 +111,276 @@ def _uses_openrouter_attribution(spec: "ProviderSpec | None", api_base: str | No
     if spec and spec.name == "openrouter":
         return True
     return bool(api_base and "openrouter" in api_base.lower())
+
+
+def _message_text(message: dict[str, Any] | None) -> str:
+    """Extract text content from a chat message payload."""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts)
+
+
+def _first_user_message(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for message in messages:
+        if message.get("role") == "user":
+            return message
+    return None
+
+
+def _is_new_conversation(messages: list[dict[str, Any]]) -> bool:
+    user_count = sum(1 for message in messages if message.get("role") == "user")
+    return bool(messages) and user_count == 1 and messages[-1].get("role") == "user"
+
+
+def _extract_replay_session_id(messages: list[dict[str, Any]]) -> str | None:
+    first_user = _first_user_message(messages)
+    if not first_user:
+        return None
+    first_user_text = _message_text(first_user)
+    match = _REPLAY_TAG_RE.search(first_user_text)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _timestamp_slug() -> str:
+    return datetime.utcnow().isoformat(timespec="milliseconds").replace(":", "-") + "Z"
+
+
+def _recording_storage_root() -> Path | None:
+    storage_directory = os.getenv("RECORD_LLM_INPUT_AND_OUTPUT_STORAGE_DIRECTORY")
+    if not storage_directory:
+        return None
+    return Path(storage_directory).expanduser() / "sessions"
+
+
+def _recording_enabled() -> bool:
+    return os.getenv("RECORD_LLM_INPUT_AND_OUTPUT") == "1"
+
+def _replay_llm_output_first_token_delay_in_millis() -> int:
+    default_delay = 3000
+    delay_str = os.getenv("REPLAY_LLM_OUTPUT_FIRST_TOKEN_DELAY_IN_MILLIS", str(default_delay))
+    try:
+        delay = int(delay_str)
+        if delay < 0:
+            raise ValueError("Delay cannot be negative.")
+        return delay
+    except ValueError:
+        logger.warning(
+            "Invalid value for REPLAY_LLM_OUTPUT_FIRST_TOKEN_DELAY_IN_MILLIS: '{}'. Using default of {} ms.",
+            delay_str,
+            default_delay,
+        )
+        return default_delay
+
+def _to_jsonable(value: Any) -> Any:
+    mapping = _coerce_dict(value)
+    if mapping is not None:
+        return {str(key): _to_jsonable(val) for key, val in mapping.items()}
+    if isinstance(value, list):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_to_jsonable(payload), indent=2), encoding="utf-8")
+
+
+def _start_recording_iteration(messages: list[dict[str, Any]], kwargs: dict[str, Any]) -> Path | None:
+    global _current_recorded_session_storage_dir_name
+
+    if not _recording_enabled():
+        logger.warning("Recording LLM input and output is disabled.")
+        return None
+    sessions_directory = _recording_storage_root()
+    if sessions_directory is None:
+        logger.error(
+            "Storage directory for recording LLM input and output is not set. "
+            "Please set RECORD_LLM_INPUT_AND_OUTPUT_STORAGE_DIRECTORY."
+        )
+        return None
+
+    logger.warning(
+        "Recording LLM input and output is enabled. Storage directory: {}",
+        sessions_directory.parent,
+    )
+
+    if _current_recorded_session_storage_dir_name is None and not _is_new_conversation(messages):
+        logger.warning("Recording a session from the middle.")
+
+    if _current_recorded_session_storage_dir_name is None or _is_new_conversation(messages):
+        _current_recorded_session_storage_dir_name = f"{_timestamp_slug()}_{uuid.uuid4()}"
+        logger.warning(
+            "Recording a new session to directory: {}",
+            sessions_directory / _current_recorded_session_storage_dir_name,
+        )
+
+    iteration_directory = (
+        sessions_directory
+        / _current_recorded_session_storage_dir_name
+        / "iterations"
+        / _timestamp_slug()
+    )
+    logger.warning(
+        "Recording LLM input for current iteration in directory: {}",
+        iteration_directory,
+    )
+    _write_json(iteration_directory / "params.json", kwargs)
+    return iteration_directory
+
+
+def _parse_chunk_timestamp(path: Path) -> float | None:
+    match = re.match(r"^\d+_(\d{4}-\d{2}-\d{2})T(\d{2}-\d{2}-\d{2}\.\d{3}Z)\.json$", path.name)
+    if not match:
+        return None
+    timestamp_str = f"{match.group(1)}T{match.group(2).replace('-', ':')}"
+    try:
+        return datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+    except ValueError:
+        return None
+
+
+def _load_replay_stream_chunks(iteration_directory: Path) -> tuple[list[dict[str, Any]], list[float | None]]:
+    stream_chunks_directory = iteration_directory / "stream_chunks"
+    if not stream_chunks_directory.exists():
+        # logger.error("No iterations found for replay session: {}", iteration_directory.parent.parent.name)
+        return [], []
+
+    chunks: list[dict[str, Any]] = []
+    timestamps: list[float | None] = []
+    for chunk_path in sorted(stream_chunks_directory.iterdir()):
+        if not chunk_path.is_file() or chunk_path.suffix != ".json":
+            continue
+        try:
+            chunks.append(json.loads(chunk_path.read_text(encoding="utf-8")))
+            timestamps.append(_parse_chunk_timestamp(chunk_path))
+        except json.JSONDecodeError:
+            logger.exception("Failed to parse chunk file: {}", chunk_path)
+            return [], []
+    if not chunks:
+        logger.warning("No valid chunk files found for iteration directory: {}", iteration_directory)
+        return [], []
+    if len(chunks) != len(timestamps):
+        logger.warning(
+            "Mismatch between number of chunk files and timestamps for iteration directory: {}",
+            iteration_directory,
+        )
+        return [], []
+    return chunks, timestamps
+
+
+def _record_stream_chunk(iteration_directory: Path, chunk_index: int, chunk: Any) -> None:
+    chunk_id = f"{chunk_index:06d}_{_timestamp_slug()}"
+    if chunk_index == 1:
+        logger.warning(
+            "Recording streaming chunks for current iteration in directory: {}",
+            iteration_directory / "stream_chunks",
+        )
+    _write_json(iteration_directory / "stream_chunks" / f"{chunk_id}.json", chunk)
+
+
+def _load_replay_response(iteration_directory: Path) -> dict[str, Any] | None:
+    response_path = iteration_directory / "response.json"
+    if not response_path.exists():
+        return None
+    try:
+        return json.loads(response_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def _load_available_replay_sessions() -> dict[str, list[dict[str, Any]]]:
+    sessions_directory = _recording_storage_root()
+    if sessions_directory is None:
+        logger.error(
+            "Replay requested but RECORD_LLM_INPUT_AND_OUTPUT_STORAGE_DIRECTORY is not set."
+        )
+        return {}
+    if not sessions_directory.exists():
+        return {}
+
+    available_sessions: dict[str, list[dict[str, Any]]] = {}
+    for session_directory in sorted(path for path in sessions_directory.iterdir() if path.is_dir()):
+        iterations_directory = session_directory / "iterations"
+        if not iterations_directory.exists():
+            continue
+
+        session_iterations: list[dict[str, Any]] = []
+        for iteration_directory in sorted(path for path in iterations_directory.iterdir() if path.is_dir()):
+            replay_response = _load_replay_response(iteration_directory)
+            replay_chunks, replay_timestamps = _load_replay_stream_chunks(iteration_directory)
+            session_iterations.append({
+                "iteration_directory": iteration_directory,
+                "response": replay_response,
+                "chunks": replay_chunks,
+                "timestamps": replay_timestamps,
+            })
+
+        if session_iterations:
+            available_sessions[session_directory.name] = session_iterations
+
+    return available_sessions
+
+
+_recorded_sessions = _load_available_replay_sessions()
+logger.warning(f"Loaded {len(_recorded_sessions)} recorded sessions ready for replay.")
+
+
+def _load_replay_iteration_data(messages: list[dict[str, Any]], session_key: str | None) -> dict[str, Any] | None:
+    replay_session_id = _extract_replay_session_id(messages)
+    if not replay_session_id:
+        logger.warning("No replay session ID found in the first user message. Streaming from provider.")
+        return None
+
+    if not session_key:
+        logger.warning("session_key is not provided, skipping checking replay")
+        return None
+
+    logger.warning(f"Current agent session: {session_key}. Target replay session: {replay_session_id}")
+
+    if _is_new_conversation(messages):
+        _current_replayed_iteration_index_mappings[session_key] = -1
+
+    session_iterations = _recorded_sessions.get(replay_session_id)
+    if not session_iterations:
+        logger.warning("Current agent session: {}. No replay iterations found for session: {}", session_key, replay_session_id)
+        return None
+
+    iteration_directory = session_iterations[0]["iteration_directory"].parent.parent
+    logger.warning("Current agent session: {}. Replaying session from directory: {}", session_key, iteration_directory)
+
+    next_index = _current_replayed_iteration_index_mappings[session_key] + 1
+    if next_index >= len(session_iterations):
+        logger.warning("Current agent session: {}. No more iterations available to replay for session: {}", session_key, replay_session_id)
+        return None
+    _current_replayed_iteration_index_mappings[session_key] = next_index
+    logger.warning(
+        "Current agent session: {}. Replaying iteration ({}/{}) for session.",
+        session_key,
+        next_index + 1,
+        len(session_iterations),
+    )
+    return session_iterations[next_index]
 
 
 class OpenAICompatProvider(LLMProvider):
@@ -545,13 +827,45 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        session_key: str | None = None,
     ) -> LLMResponse:
         kwargs = self._build_kwargs(
             messages, tools, model, max_tokens, temperature,
             reasoning_effort, tool_choice,
         )
+
+        replay_iteration_data = _load_replay_iteration_data(messages, session_key)
+        if replay_iteration_data is not None:
+            replay_iteration_directory = replay_iteration_data["iteration_directory"]
+            replay_response = replay_iteration_data.get("response")
+            if replay_response is not None:
+                logger.warning("Replaying non-stream response from directory: {}", replay_iteration_directory)
+                # delay before first token to simulate LLM thinking time, configurable via env var
+                first_token_delay_ms = _replay_llm_output_first_token_delay_in_millis()
+                if first_token_delay_ms > 0:
+                    logger.warning("Delaying first token by {} ms to simulate LLM thinking time.", first_token_delay_ms)
+                    await asyncio.sleep(first_token_delay_ms / 1000.0)
+                return self._parse(replay_response)
+            replay_chunks = replay_iteration_data.get("chunks") or []
+            if replay_chunks:
+                logger.warning(
+                    "Replaying {} streamed chunks as a non-stream response.",
+                    len(replay_chunks),
+                )
+                # delay before first token to simulate LLM thinking time, configurable via env var
+                first_token_delay_ms = _replay_llm_output_first_token_delay_in_millis()
+                if first_token_delay_ms > 0:
+                    logger.warning("Delaying first token by {} ms to simulate LLM thinking time.", first_token_delay_ms)
+                    await asyncio.sleep(first_token_delay_ms / 1000.0)
+                return self._parse_chunks(replay_chunks)
+
+        iteration_directory = _start_recording_iteration(messages, kwargs)
         try:
-            return self._parse(await self._client.chat.completions.create(**kwargs))
+            logger.warning("Requesting LLM provider...(non-stream)")
+            response = await self._client.chat.completions.create(**kwargs)
+            if iteration_directory is not None:
+                _write_json(iteration_directory / "response.json", response)
+            return self._parse(response)
         except Exception as e:
             return self._handle_error(e)
 
@@ -565,6 +879,7 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        session_key: str | None = None,
     ) -> LLMResponse:
         kwargs = self._build_kwargs(
             messages, tools, model, max_tokens, temperature,
@@ -572,11 +887,59 @@ class OpenAICompatProvider(LLMProvider):
         )
         kwargs["stream"] = True
         kwargs["stream_options"] = {"include_usage": True}
+
+        replay_iteration_data = _load_replay_iteration_data(messages, session_key)
+        if replay_iteration_data is not None:
+            replay_iteration_directory = replay_iteration_data["iteration_directory"]
+            replay_chunks = replay_iteration_data.get("chunks") or []
+            replay_timestamps = replay_iteration_data.get("timestamps") or []
+            if replay_chunks:
+                logger.warning("Streaming {} chunks from replay.", len(replay_chunks))
+                # delay before first token to simulate LLM thinking time, configurable via env var
+                first_token_delay_ms = _replay_llm_output_first_token_delay_in_millis()
+                if first_token_delay_ms > 0:
+                    logger.warning("Delaying first token by {} ms to simulate LLM thinking time.", first_token_delay_ms)
+                    await asyncio.sleep(first_token_delay_ms / 1000.0)
+                previous_timestamp: float | None = None
+                for chunk, timestamp in zip(replay_chunks, replay_timestamps, strict=False):
+                    if previous_timestamp is not None and timestamp is not None:
+                        await asyncio.sleep(max(0.0, timestamp - previous_timestamp))
+                    previous_timestamp = timestamp if timestamp is not None else previous_timestamp
+                    if on_content_delta:
+                        delta = self._extract_text_content(
+                            ((chunk.get("choices") or [{}])[0].get("delta") or {}).get("content")
+                        )
+                        if delta:
+                            await on_content_delta(delta)
+                return self._parse_chunks(replay_chunks)
+
+            replay_response = replay_iteration_data.get("response")
+            if replay_response is not None:
+                logger.warning(
+                    "No replay stream chunks found; replaying stored non-stream response from {}",
+                    replay_iteration_directory,
+                )
+                # delay before first token to simulate LLM thinking time, configurable via env var
+                first_token_delay_ms = _replay_llm_output_first_token_delay_in_millis()
+                if first_token_delay_ms > 0:
+                    logger.warning("Delaying first token by {} ms to simulate LLM thinking time.", first_token_delay_ms)
+                    await asyncio.sleep(first_token_delay_ms / 1000.0)
+                replayed = self._parse(replay_response)
+                if on_content_delta and replayed.content:
+                    await on_content_delta(replayed.content)
+                return replayed
+
+        iteration_directory = _start_recording_iteration(messages, kwargs)
         try:
+            logger.warning("Requesting LLM provider...(stream)")
             stream = await self._client.chat.completions.create(**kwargs)
             chunks: list[Any] = []
+            chunk_index = 0
             async for chunk in stream:
                 chunks.append(chunk)
+                chunk_index += 1
+                if iteration_directory is not None:
+                    _record_stream_chunk(iteration_directory, chunk_index, chunk)
                 if on_content_delta and chunk.choices:
                     text = getattr(chunk.choices[0].delta, "content", None)
                     if text:
